@@ -3,6 +3,7 @@ import time
 import random
 import re
 import pathlib
+import requests
 from django.http import StreamingHttpResponse, JsonResponse, HttpResponseRedirect, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.shortcuts import get_object_or_404
@@ -61,6 +62,8 @@ def _resolve_output_format(user, force=None, request=None):
         'mp4':    'fmp4',
         'hls':    'hls',
         'm3u8':   'hls',
+        'hls_passthrough': 'hls_passthrough',
+        'm3u8_passthrough': 'hls_passthrough',
     }
     if force:
         return force
@@ -603,20 +606,22 @@ def stream_ts(request, channel_id, user=None, force_output_format=None):
                 f"(output: {resolved_format}, profile: {output_profile.id if output_profile else None})"
             )
 
-        if output_format == 'hls':
+        if output_format in ('hls', 'hls_passthrough'):
             # HLS is pull-based: no long-lived response. Start the segmenter
             # and redirect to the client-scoped playlist so reloads and
             # relative segment URIs resolve against a URL that carries the
             # client_id (each request touches the client record; the ghost
             # reaper handles disconnect, same as every other client type).
-            proxy_server.ensure_output_format(
-                channel_id, resolved_format,
-                source_buffer=source_buffer if output_profile else None,
-            )
+            if output_format == 'hls':
+                proxy_server.ensure_output_format(
+                    channel_id, resolved_format,
+                    source_buffer=source_buffer if output_profile else None,
+                )
             # Hardcoded mount path, matching how generate_m3u builds
             # /proxy/ts/stream/ URLs (apps/output/views.py).
+            passthrough_qs = "?mode=passthrough" if output_format == 'hls_passthrough' else ""
             return HttpResponseRedirect(
-                f"/proxy/hls/{channel_id}/{client_id}/index.m3u8"
+                f"/proxy/hls/{channel_id}/{client_id}/index.m3u8{passthrough_qs}"
             )
         elif output_format == 'fmp4':
             proxy_server.ensure_output_format(
@@ -1082,11 +1087,14 @@ def next_stream(request, channel_id):
 
 def _hls_resolved_format(client_hash):
     """Compose the output manager key from the client's registered format."""
+    output_format = ((client_hash or {}).get("output_format") or "hls").strip()
+    if output_format == "hls_passthrough":
+        return None
     profile_id = (client_hash or {}).get("output_profile_id") or ""
     return f"hls:p{profile_id}" if profile_id else "hls"
 
 
-def _hls_touch_client(channel_id, client_id):
+def _hls_touch_client(channel_id, client_id, fallback_output_format='hls'):
     """
     Refresh the client's activity record; returns the client hash, or a
     freshly re-registered minimal hash when the record lapsed while the
@@ -1116,7 +1124,7 @@ def _hls_touch_client(channel_id, client_id):
             "last_active": now,
             "worker_id": "unknown",
             "user_id": "0",
-            "output_format": "hls",
+            "output_format": fallback_output_format,
             "output_profile_id": "",
         }
         pipe.hset(client_key, mapping=client_hash)
@@ -1143,6 +1151,54 @@ def _hls_session_gone(channel_id, client_id):
     return False
 
 
+def _hls_passthrough_playlist(channel_id):
+    """Fetch and return the upstream HLS playlist body and content type."""
+    proxy_server = ProxyServer.get_instance()
+    redis_client = proxy_server.redis_client
+    if not redis_client:
+        return None, None, JsonResponse({"error": "Proxy unavailable"}, status=503)
+
+    metadata_key = RedisKeys.channel_metadata(channel_id)
+    upstream_url, upstream_user_agent = redis_client.hmget(
+        metadata_key,
+        ChannelMetadataField.URL,
+        ChannelMetadataField.USER_AGENT,
+    )
+
+    if not upstream_url:
+        return None, None, JsonResponse({"error": "Upstream URL unavailable"}, status=503)
+
+    if not str(upstream_url).lower().startswith(("http://", "https://")):
+        return None, None, JsonResponse(
+            {"error": "HLS passthrough requires an HTTP(S) upstream URL"},
+            status=400,
+        )
+
+    headers = {'Connection': 'close'}
+    if upstream_user_agent:
+        headers['User-Agent'] = upstream_user_agent
+
+    try:
+        response = requests.get(
+            upstream_url,
+            headers=headers,
+            timeout=(5, 10),
+            allow_redirects=True,
+        )
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"[HLS passthrough:{channel_id}] Upstream playlist fetch failed: {e}")
+        return None, None, JsonResponse({"error": "Failed to fetch upstream playlist"}, status=502)
+
+    if not (200 <= response.status_code < 300):
+        logger.warning(
+            f"[HLS passthrough:{channel_id}] Upstream returned HTTP {response.status_code}"
+        )
+        return None, None, JsonResponse({"error": "Upstream playlist unavailable"}, status=502)
+
+    content_type = response.headers.get("Content-Type", "application/vnd.apple.mpegurl")
+    return response.content, content_type, None
+
+
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def hls_playlist(request, channel_id, client_id):
@@ -1153,9 +1209,18 @@ def hls_playlist(request, channel_id, client_id):
     if _hls_session_gone(channel_id, client_id):
         return JsonResponse({"error": "Stream stopped"}, status=410)
 
-    client_hash = _hls_touch_client(channel_id, client_id)
+    fallback_output_format = 'hls_passthrough' if request.GET.get('mode') == 'passthrough' else 'hls'
+    client_hash = _hls_touch_client(channel_id, client_id, fallback_output_format=fallback_output_format)
     if client_hash is None:
         return JsonResponse({"error": "Proxy unavailable"}, status=503)
+
+    if (client_hash.get("output_format") or "").strip() == "hls_passthrough":
+        body, content_type, err = _hls_passthrough_playlist(channel_id)
+        if err is not None:
+            return err
+        response = HttpResponse(body, content_type=content_type)
+        response["Cache-Control"] = "no-cache"
+        return response
 
     fmt = _hls_resolved_format(client_hash)
     proxy_server = ProxyServer.get_instance()
@@ -1201,9 +1266,13 @@ def hls_segment(request, channel_id, client_id, seq):
     if _hls_session_gone(channel_id, client_id):
         return JsonResponse({"error": "Stream stopped"}, status=410)
 
-    client_hash = _hls_touch_client(channel_id, client_id)
+    fallback_output_format = 'hls_passthrough' if request.GET.get('mode') == 'passthrough' else 'hls'
+    client_hash = _hls_touch_client(channel_id, client_id, fallback_output_format=fallback_output_format)
     if client_hash is None:
         return JsonResponse({"error": "Proxy unavailable"}, status=503)
+
+    if (client_hash.get("output_format") or "").strip() == "hls_passthrough":
+        return JsonResponse({"error": "No local HLS segments in passthrough mode"}, status=404)
 
     fmt = _hls_resolved_format(client_hash)
 

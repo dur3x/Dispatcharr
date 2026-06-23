@@ -1472,6 +1472,7 @@ const ChannelsTable = ({ onReady }) => {
                         { value: 'mpegts', label: 'MPEG-TS' },
                         { value: 'fmp4', label: 'fMP4 (fragmented MP4)' },
                         { value: 'hls', label: 'HLS' },
+                        { value: 'hls_passthrough', label: 'HLS Passthrough' },
                       ]}
                     />
                     <Select
