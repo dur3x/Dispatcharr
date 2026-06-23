@@ -708,6 +708,8 @@ def stream_xc(request, username, password, channel_id):
         force_format = 'mpegts'
     elif extension.lower() == '.m3u8':
         force_format = 'hls'
+    elif extension.lower() == '.m3u8p':
+        force_format = 'hls_passthrough'
     else:
         force_format = None
     return stream_ts(request._request, str(channel.uuid), user, force_output_format=force_format)
