@@ -397,6 +397,9 @@ class CoreSettings(models.Model):
             "channel_init_grace_period": 60,
             "channel_client_wait_period": 5,
             "new_client_behind_seconds": 5,
+            # XC catch-up: forced XMLTV lookback window in days (0 = auto-detect
+            # from the providers' largest tv_archive_duration, capped at 30).
+            "xmltv_prev_days_override": 0,
         })
 
     # System Settings
