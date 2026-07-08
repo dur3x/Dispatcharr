@@ -661,33 +661,22 @@ def stream_ts(request, channel_id, user=None, force_output_format=None):
             )
 
         if resolved_output_format in ('hls', 'hls_passthrough'):
-            # HLS is pull-based: start/ensure the remux pipeline then redirect
-            # to a client-scoped playlist URL.
-            if not proxy_server.ensure_output_format(
-                channel_id,
-                resolved_format,
-                source_buffer=source_buffer if resolved_output_profile else None,
-            ):
-                if _client_pre_registered:
-                    _drop_pre_registered_client(proxy_server, channel_id, client_id)
-                return JsonResponse(
-                    {"error": "Failed to start output format remux"}, status=500
+            # HLS is pull-based: no long-lived response. Start the segmenter
+            # and redirect to the client-scoped playlist.
+            if resolved_output_format == 'hls':
+                proxy_server.ensure_output_format(
+                    channel_id, resolved_format,
+                    source_buffer=source_buffer if resolved_output_profile else None,
                 )
-
             passthrough_qs = "?mode=passthrough" if resolved_output_format == 'hls_passthrough' else ""
             return HttpResponseRedirect(
                 f"/proxy/hls/{channel_id}/{client_id}/index.m3u8{passthrough_qs}"
             )
         elif resolved_output_format == 'fmp4':
-            if not proxy_server.ensure_output_format(
+            proxy_server.ensure_output_format(
                 channel_id, resolved_format,
                 source_buffer=source_buffer if resolved_output_profile else None,
-            ):
-                if _client_pre_registered:
-                    _drop_pre_registered_client(proxy_server, channel_id, client_id)
-                return JsonResponse(
-                    {"error": "Failed to start output format remux"}, status=500
-                )
+            )
             generate = create_fmp4_stream_generator(
                 channel_id, client_id, client_ip, client_user_agent, channel_initializing, user=user,
                 fmt=resolved_format,
