@@ -1,4 +1,5 @@
 """Shared configuration between proxy types"""
+import os
 import time
 from django.db import connection
 
@@ -10,7 +11,8 @@ class BaseConfig:
     RETRY_WINDOW_SECONDS = 1800  # Reset retry counter after this long without a failure
     STABLE_CONNECTION_THRESHOLD = 30  # Seconds of uptime before switch rotation state resets
     RETRY_WAIT_INTERVAL = 0.5  # seconds to wait between retries
-    CONNECTION_TIMEOUT = 10  # seconds to wait for initial connection
+    # Connection timeout for upstream requests. Configurable via DISPATCHARR_CONNECTION_TIMEOUT env (default 60s).
+    CONNECTION_TIMEOUT = int(os.environ.get("DISPATCHARR_CONNECTION_TIMEOUT", "60"))
     MAX_STREAM_SWITCHES = 10  # Maximum number of stream switch attempts before giving up
     BUFFER_CHUNK_SIZE = 188 * 1361  # ~256KB
     BUFFERING_TIMEOUT = 15  # Seconds to wait for buffering before switching streams
